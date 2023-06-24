@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""
+Copyright 2023 Michael Davidsaver
+SPDX-License-Identifier: GPL-3.0-or-later
+"""
+
+import asyncio
+import binascii
+from collections import OrderedDict
+from dataclasses import dataclass
+import json
+import logging
+import struct
+import socket
+
+_log = logging.getLogger(__name__)
+
+class Buf:
+    'Byte buffer to be rendered as ascii'
+    def __init__(self, buf:bytes):
+        self.buf = buf
+    def __str__(self):
+        return binascii.hexlify(self.buf).decode()
+    __repr__ = __str__
+
+def getargs():
+    import argparse
+    def endpoint(s: str):
+        'Parse ipaddr:port as ("ipaddr", port)'
+        host, _sep, port = s.partition(':')
+        port = int(port or '4800')
+        return (host, port)
+
+    P = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    P.add_argument('-P', '--json-pretty', action='store_const', const=json_pretty,
+                   dest='output', default=json_pretty,
+                   help='Output JSON, one entry per line.')
+    P.add_argument('-J', '--json-terse', action='store_const', const=json_terse,
+                   dest='output', 
+                   help='Output JSON, one entry per line.')
+    P.add_argument('-v', '--verbose',
+                   action='store_const', dest='level',
+                   const=logging.DEBUG, default=logging.INFO)
+    P.add_argument('-q', '--quiet',
+                   action='store_const', dest='level',
+                   const=logging.WARN)
+    P.add_argument('-B', '--bind', type=endpoint, metavar='IP:PORT',
+                   default='0.0.0.0:0',
+                   help='Bind to this address.')
+    P.add_argument('-D', '--dest', type=endpoint, metavar='IP:PORT',
+                   default='255.255.255.255',
+                   help='Destination IP address.')
+    P.add_argument('-t', '--wait-time', type=float, default=2.0, metavar='SEC',
+                   help='Time in seconds to wait for discovery responses.')
+    P.add_argument('--query', action='store_false', dest='scan', default=False,
+                   help='Query discovered devices')
+    P.add_argument('--scan', action='store_true',
+                   help='Scan all possible request ID and report positive responses')
+    return P
+
+def json_terse(D:dict):
+    try:
+        print(json.dumps(D))
+    except:
+        _log.exception('Error while encoding %r', D)
+
+def json_pretty(D:dict):
+    try:
+        print(json.dumps(D, indent=4))
+    except:
+        _log.exception('Error while encoding %r', D)
+
+@dataclass
+class RemoteError(RuntimeError):
+    id: int
+    sts: int
+    peer: tuple
+
+class MoxaUDP(asyncio.DatagramProtocol):
+    def connection_made(self, trn):
+        self.trn = trn
+        self._next_seq = 0
+        self._pending = {} # {seq:future}
+
+    def get_seq(self) -> int:
+        'Return an unused sequence number'
+        assert len(self._pending)<0xffffffff
+        ret = self._next_seq
+        self._next_seq = (self._next_seq+1)&0xffffffff
+        while self._next_seq in self._pending:
+            self._next_seq = (self._next_seq+1)&0xffffffff
+        return ret
+
+    def sendmsg(self, id:int, seq:int, body:bytes, flags:int = 0):
+        blen = len(body)+8
+        msg = struct.pack('!BBHI', id, flags, blen, seq) + body
+        _log.debug('TX %s', Buf(msg))
+        self.trn.sendto(msg)
+
+    async def request(self, id:int, body:bytes, flags:int = 0) -> bytes:
+        """Make request and await reply
+        """
+        seq = self.get_seq()
+        done = asyncio.Future()
+        self.sendmsg(id, seq, body, flags=flags)
+        self._pending[seq] = done
+        buf, src = await done
+        if buf[0]!=(0x80|id):
+            raise RuntimeError(f"Reply from {src} with different request id?!? 0x{id:02x} 0x{buf[0]:02x}")
+        elif buf[1]!=0:
+            raise RemoteError(id=id, sts=buf[1], peer=src)
+        return buf, src
+
+    def discover(self) -> asyncio.Queue:
+        """Send discover ping and return queue through which any replies are delivered
+        """
+        seq = self.get_seq()
+        Q = asyncio.Queue()
+        self.sendmsg(1, seq, b'')
+        self._pending[seq] = Q
+        return Q
+
+    def datagram_received(self, buf, src):
+        _log.debug('RX %s -> %s', src, Buf(buf))
+
+        if len(buf)<8:
+            _log.warn('Ignore truncated: %s', Buf(buf))
+            return
+
+        id, sts, blen, seq = struct.unpack('!BBHI', buf[:8])
+
+        if blen > len(buf):
+            _log.warn('Ignore truncated: %s', Buf(buf))
+            return
+
+        elif blen < len(buf):
+            _log.warn('Extra junk?  %r', buf)
+            buf = buf[:blen]
+
+        elif not (id&0x80):
+            _log.warn('Not a reply: %s', Buf(buf))
+            return
+
+        done = self._pending.get(seq)
+
+        if done is None:
+            _log.warn('Unsolicited reply: %s', Buf(buf))
+        elif asyncio.isfuture(done):
+            done.set_result((buf, src))
+            self._pending.pop(seq)
+        else:
+            done.put_nowait((buf, src))
+
+def start_output(devid:bytes):
+    parts = struct.unpack('<IH6B', devid)
+    R = OrderedDict([
+        ('apid',  parts[0]),
+        ('model', '%02x'%parts[1]),
+        ('ethernet', ':'.join(['%02x'%b for b in parts[2:]])),
+    ])
+    return R
+
+async def interrogate(args, proto:MoxaUDP, devid:bytes):
+    R = start_output(devid)
+    R['replies'] = replies = {}
+    for id in range(2, 0x80):
+        try:
+            buf, src = await asyncio.wait_for(proto.request(id, devid), 0.1)
+            _log.debug('Reply %s -> %s', src, Buf(buf))
+            R['source'] = '%s:%d'%src
+            replies[id] = binascii.hexlify(buf).decode()
+        except RemoteError as e:
+            _log.debug('Bad request id %d 0x%02x', id, e.sts)
+        except asyncio.TimeoutError:
+            _log.debug('%s no reply to %d', Buf(devid), id)
+
+    args.output(R)
+
+async def query(args, proto:MoxaUDP, devid:bytes):
+    R = start_output(devid)
+
+    buf, src = await proto.request(0x10, devid)
+    R['source'] = '%s:%d'%src
+    R['device_name'] = buf[20:].rstrip(b'\0').decode()
+
+    buf, src = await proto.request(0x21, devid)
+    R['address'] = socket.inet_ntoa(buf[20:24])
+    buf, src = await proto.request(0x22, devid)
+    R['netmask'] = socket.inet_ntoa(buf[20:24])
+    buf, src = await proto.request(0x23, devid)
+    R['gateway'] = socket.inet_ntoa(buf[20:24])
+
+    buf, src = await proto.request(0x16, devid)
+    R['firmware_version'], = struct.unpack('<I', buf[20:24])
+    R['sn'], = struct.unpack('<H', buf[28:30])
+
+    args.output(R)
+
+async def scan(args, proto:MoxaUDP):
+    'Send discovery ping and await any replies'
+    dQ = proto.discover()
+    while True:
+        buf, src = await dQ.get()
+
+        apid, model = struct.unpack('<IH', buf[8:14])
+        mac = ':'.join(['%02x'%b for b in buf[14:20]])
+        ip = socket.inet_ntoa(buf[20:24])
+
+        if buf[4:8]!=b'\0\0\0\0':
+            _log.warn('Unexpected reply query?: %r', buf)
+        if src[0]!=ip:
+            _log.warn('Proxied reply? %s %s', src, ip)
+
+        _log.info('Discovered %s %s : 0x%08x 0x%04x', mac, ip, apid, model)
+
+        devid = buf[8:20] # (APID, model?, MAC)
+        if args.scan:
+            asyncio.create_task(interrogate(args, proto, devid))
+        else:
+            asyncio.create_task(query(args, proto, devid))
+
+async def main(args):
+    import signal
+    loop = asyncio.get_running_loop()
+
+    done = asyncio.Event()
+    loop.add_signal_handler(signal.SIGINT, done.set)
+    loop.add_signal_handler(signal.SIGTERM, done.set)
+
+    trn, proto = await loop.create_datagram_endpoint(MoxaUDP,
+                                                     local_addr=args.bind,
+                                                     remote_addr=args.dest,
+                                                     allow_broadcast=True)
+    _log.info('Listening on %s', trn.get_extra_info('sockname'))
+    _log.info('Sending to on %s', args.dest) # trn.get_extra_info('peername'))
+
+    # kick off actual work
+    asyncio.create_task(scan(args, proto))
+
+    # wait for SIGINT or timeout
+    try:
+        await asyncio.wait_for(done.wait(), args.wait_time)
+    except asyncio.TimeoutError:
+        pass
+
+    # cleanup
+    me = asyncio.current_task(loop)
+    tasks = [t for t in asyncio.all_tasks(loop) if t is not me]
+    [t.cancel() for t in tasks]
+    for t in tasks:
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+
+if __name__=='__main__':
+    args = getargs().parse_args()
+    logging.basicConfig(level=args.level)
+    asyncio.run(main(args), debug=args.level<=logging.DEBUG)

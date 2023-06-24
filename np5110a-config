@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""
+Copyright 2023 Michael Davidsaver
+SPDX-License-Identifier: GPL-3.0-or-later
+"""
+"""
+CLI to upload/import configuration for a Moxa NPort 5110A.
+
+Why Selenium?
+
+This device has no TLS/SSL support, and so uses javascript
+to hash passwords to avoid sending them in the clear.
+This process is more or less straight forward, and can
+be replicated with python code.  But is tedious and perhaps
+not so future proof.  (although it seems doubtful that this
+device will ever get an update changing this situation...)
+
+Additionally, this device serves up hillariously non-conformant
+HTML, which complicates use of eg. html.parse.HTMLParser.
+
+* no <html> tag.
+* no <head> tag. (apparently browsers treat everything before <body> as header?)
+* <body> without matching </body>
+* some tag names are camel case
+* inconsistent quoting for attribute values.
+
+So opt for Selenium to have a javascript evaluation, and a
+full DOM, which can apparently handle this level of weirdness.
+"""
+
+import logging
+import os
+import sys
+
+from urllib.parse import urlparse
+
+# on RHEL9
+#  dnf install python3-selenium webkit2gtk3-devel
+from selenium import webdriver
+from selenium.common.exceptions import NoSuchElementException
+from selenium.webdriver.support.ui import WebDriverWait
+
+_log = logging.getLogger(__name__)
+
+class WaitNextPage:
+    """Helper to wait when an action (form submit) is expected to jump to another page.
+    """
+    def __init__(self, D: webdriver.WebKitGTK):
+        self.D = D
+    def wait_next_page(self):
+        """Wait for current_url to change
+        """
+        _log.info('Await next page')
+        WebDriverWait(self.D, 5).until_not(lambda D:D.current_url==self.cur)
+        self.cur = self.D.current_url        
+        _log.info('Now at %r', self.cur)
+    def __enter__(self):
+        self.cur = self.D.current_url
+        _log.info('Initially at %r', self.cur)
+        return self
+    def __exit__(self,A,B,C):
+        pass
+
+def getargs():
+    import argparse
+    P = argparse.ArgumentParser(description='Automatically load a previously downloaded (and edited) NP5110A config file and restarts',
+                                formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    P.add_argument('-U', '--user', default='admin',
+                   metavar='NAME',
+                   help='User name')
+    P.add_argument('-P', '--password', default='moxa',
+                   metavar='PW',
+                   help='Password')
+    P.add_argument('-N', '--change-ip', action='store_true',
+                   help='Apply network configuration.  May change IP!')
+    P.add_argument('url', help='Base URL of NP5110A (eg. http://192.168.127.254 )')
+    P.add_argument('config', help='Path of config file to load')
+    return P
+
+def main(args):
+    args.config = os.path.abspath(args.config)
+    if not os.path.isfile(args.config):
+        _log.error("Not a file %r", args.config)
+        sys.exit(1)
+
+    if 'DISPLAY' not in os.environ:
+        _log.error('Selenium requires a running X11 server')
+        sys.exit(1)
+
+    with webdriver.WebKitGTK() as D, WaitNextPage(D) as NP:
+        D.get(args.url)
+        baseurl = urlparse(D.current_url)._replace(path='', query='')
+        _log.info('Base URL %r', baseurl.geturl())
+
+        # fill in and submit the login form
+        D.find_element_by_id('Username').send_keys('admin')
+        D.find_element_by_id('Password').send_keys('moxa')
+        D.find_element_by_id('Password').submit()
+        NP.wait_next_page()
+        _log.info('Logged in')
+
+        # at this point we _may_ be directed to a nag screen about failed logins
+        try:
+            D.find_element_by_xpath("//input[@name='clearLog']").submit()
+        except NoSuchElementException:
+            _log.info('No asked to clear log')
+        else:
+            NP.wait_next_page()
+            _log.info('cleared log')
+
+        # now we may be nagged about changing the password...
+        try:
+            D.find_element_by_xpath("//input[@name='Skip']").click()
+        except NoSuchElementException:
+            _log.info('No asked to change password')
+        else:
+            NP.wait_next_page()
+            _log.info('Skipped password change')
+
+        # at this point we should be logged in...
+        assert D.current_url.endswith('/home.htm'), D.current_url
+
+        # now jump to the Back
+        D.get(baseurl._replace(path='/Backup.htm').geturl())
+        if args.change_ip:
+            D.find_element_by_xpath("//form[@name='conf']//input[@name='IncNet']").click()
+        D.find_element_by_xpath("//form[@name='conf']//input[@type='file']").send_keys(args.config)
+        D.find_element_by_xpath("//form[@name='conf']//input[@type='submit']").submit()
+        NP.wait_next_page()
+        _log.info('Uploaded config')
+        D.find_element_by_xpath("//input[@value='Save/Restart']").click()
+        NP.wait_next_page()
+        _log.info('Rebooting...')
+        # at this point after this the device will become non-responsive while rebooting
+
+if __name__=='__main__':
+    args = getargs().parse_args()
+    logging.basicConfig(level=logging.INFO)
+    main(args)
