@@ -93,8 +93,8 @@ def main(args):
         _log.info('Base URL %r', baseurl.geturl())
 
         # fill in and submit the login form
-        D.find_element_by_id('Username').send_keys('admin')
-        D.find_element_by_id('Password').send_keys('moxa')
+        D.find_element_by_id('Username').send_keys(args.user)
+        D.find_element_by_id('Password').send_keys(args.password)
         D.find_element_by_id('Password').submit()
         NP.wait_next_page()
         _log.info('Logged in')
