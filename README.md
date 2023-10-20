@@ -24,6 +24,7 @@ $ ./nport-scan -q
     "address": "192.168.127.254",
     "netmask": "255.255.0.0",
     "gateway": "192.168.0.1",
+    "firmware_version": 17170432,
     "sn": 1234
 }
 ```
@@ -62,4 +63,23 @@ On Debian 11
 
 ```sh
 sudo apt-get install python3-selenium webkit2gtk-driver
+```
+
+## Interpreting firmware_version
+
+The decimal firmware version number reported by `nport-scan`
+is best understood in hexidecimal form.
+eg. `17170432 == 0x1060000`
+This can be compared with:
+
+The number shown on the web UI:
+
+![screen capture](docs/nport5110a-fw-version.png)
+
+The contents of a downloaded Backup file:
+
+```
+[Basic Information (not changeable)]
+...
+Firmware version=0x1060000
 ```
